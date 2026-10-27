@@ -5,9 +5,14 @@
   "keywords": [
     "pi-package",
     "pi-extension",
+    "pi",
     "prompt",
     "prompt-engineering",
-    "rewrite"
+    "prompt-rewriter",
+    "rewrite",
+    "llm",
+    "ai-agent",
+    "coding-agent"
   ],
   "license": "MIT",
   "author": "xiandeleduan <1427116865@qq.com>",
@@ -23,6 +28,9 @@
     "extensions": [
       "./extensions/prompt-rewriter.ts"
     ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
   },
   "files": [
     "extensions/",

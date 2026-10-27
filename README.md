@@ -6,6 +6,8 @@ A [pi](https://pi.dev) extension that intercepts every message you send and rewr
 
 [中文说明 ↓](#中文说明)
 
+**Contents:** [The problem](#the-problem) · [What it does](#what-it-does) · [Install](#install) · [Usage](#usage) · [Skip rules](#skip-rules-how-it-saves-you-money) · [Failure behavior](#failure-behavior) · [Configuration](#configuration) · [Troubleshooting](#troubleshooting) · [FAQ](#faq)
+
 ---
 
 ## The problem
@@ -37,6 +39,12 @@ The rewritten text **replaces** your message in the conversation, so you always 
 pi install git:github.com/xiandeleduan/pi-prompt-rewriter
 ```
 
+Pin a release if you want stability:
+
+```bash
+pi install git:github.com/xiandeleduan/pi-prompt-rewriter@v1.0.0
+```
+
 Then `/reload` in a running session.
 
 ### Option B — single file, no package manager
@@ -49,6 +57,26 @@ curl -fsSL https://raw.githubusercontent.com/xiandeleduan/pi-prompt-rewriter/mai
 Or just download `extensions/prompt-rewriter.ts` and drop it into `~/.pi/agent/extensions/`. Then `/reload`.
 
 **Requirements:** pi with an authenticated model provider. No other dependencies — this is a single self-contained file.
+
+### Verify it loaded
+
+After `/reload`, run `/rewrite`. You should see the status line under the editor:
+
+```
+自动重写 开  发送时重写 · balanced  [f2]
+```
+
+### Uninstall
+
+```bash
+# Option A
+pi remove git:github.com/xiandeleduan/pi-prompt-rewriter
+
+# Option B
+rm ~/.pi/agent/extensions/prompt-rewriter.ts
+```
+
+Then `/reload`. No configuration or state is written outside the extension file, so removal leaves nothing behind.
 
 ## Usage
 
@@ -128,6 +156,84 @@ Rewriting **never blocks sending**. If the model is unavailable, the API errors,
 | `balanced` | Default. Clarifies intent and adds obvious missing specifics |
 | `deep` | Adds boundaries, edge cases, and how to verify the result |
 
+## Configuration
+
+Defaults live at the top of `extensions/prompt-rewriter.ts`. Edit them before copying the file, or fork and edit your own copy.
+
+```ts
+const DEFAULT_CONFIG = {
+    enabled: true,        // start with automatic rewriting on
+    style: "balanced",    // "minimal" | "balanced" | "deep"
+    timeoutMs: 25_000,    // give up and send the original after this long
+    contextMessages: 12,  // how many recent messages to include
+    contextCharLimit: 1200, // per-message character cap
+};
+```
+
+| Setting | Default | Effect |
+|---|---|---|
+| `enabled` | `true` | Whether rewriting starts on. `/rewrite off` overrides per session. |
+| `style` | `balanced` | Default strength. `/rewrite style` changes it per session. |
+| `timeoutMs` | `25000` | Above this, the original text is sent unchanged. |
+| `contextMessages` | `12` | More context means better pronoun resolution but more tokens. |
+| `contextCharLimit` | `1200` | Caps how much of each message is included. |
+
+Runtime toggles (`/rewrite off`, `/rewrite deep`) apply to the **current session only** — they are not persisted across restarts.
+
+## Troubleshooting
+
+**`/rewrite` is not a recognized command**
+
+The extension isn't loaded. Run `/reload`. If it still fails, confirm the file exists:
+
+```bash
+ls ~/.pi/agent/extensions/prompt-rewriter.ts
+```
+
+**F2 does nothing**
+
+Some terminal multiplexers and editors capture F2. Check with `pi` inside a plain terminal first. If your setup captures it, change the constant near the top of the file:
+
+```ts
+const TOGGLE_SHORTCUT: Parameters<ExtensionAPI["registerShortcut"]>[0] = "f2";
+```
+
+Pick a key pi does not already bind. `f3` and `f4` are unclaimed. Avoid `Ctrl+=` / `Ctrl+-` / `Ctrl+0` (terminal zoom) and any bare printable character.
+
+**Messages are never rewritten**
+
+Check the status line. `跳过（too short）` means the input hit a skip rule. `自动重写已关` means it's off — press `F2`. If it shows `发送时重写` but nothing changes, the rewrite likely failed; run `/rewrite stat` and look at the failed counter.
+
+**Rewrites are too aggressive or too timid**
+
+`/rewrite minimal` stays close to your wording; `/rewrite deep` adds constraints and verification steps.
+
+**Status line is missing entirely**
+
+It only renders in interactive TUI mode (`ctx.mode === "tui"`). Print, JSON, and RPC modes have no editor widget.
+
+## FAQ
+
+**Does it use extra tokens?**
+
+Yes — one extra model call per rewritten message, plus up to ~1200 characters × 12 messages of context. Skip rules exist specifically to avoid paying for `好`, `/commands`, and pasted structured prompts.
+
+**Does it rewrite my message history?**
+
+No. It rewrites the outgoing message only. Previous turns are untouched.
+
+**Which model does it use?**
+
+Whichever model is currently active (`ctx.model`). No separate API key or provider configuration is needed.
+
+**Can I see what was sent?**
+
+The rewritten text replaces your message in the transcript, so it's always visible. `/rewrite last` shows the before/after pair.
+
+**Does it work in non-interactive mode?**
+
+Rewriting itself works (`pi -p` included), but skip rules apply and there is no status line. Note that `pi -p` does **not** dispatch slash commands, so `/rewrite` there is treated as plain text.
+
 ## Design notes
 
 - **Context-aware**: pulls the last 12 messages (user + assistant text only; tool calls and results are filtered as noise) so pronouns and references resolve correctly.
@@ -174,7 +280,28 @@ MIT
 pi install git:github.com/xiandeleduan/pi-prompt-rewriter
 ```
 
+锁定版本：
+
+```bash
+pi install git:github.com/xiandeleduan/pi-prompt-rewriter@v1.0.0
+```
+
 或者下载 `extensions/prompt-rewriter.ts` 放进 `~/.pi/agent/extensions/`。然后 `/reload`。
+
+**验证已加载**：`/reload` 后输入 `/rewrite`，输入框下方应出现状态条：
+
+```
+自动重写 开  发送时重写 · balanced  [f2]
+```
+
+**卸载**：
+
+```bash
+pi remove git:github.com/xiandeleduan/pi-prompt-rewriter   # 方式 A
+rm ~/.pi/agent/extensions/prompt-rewriter.ts              # 方式 B
+```
+
+然后 `/reload`。插件不在外部写任何配置或状态，删除后不留残留。
 
 **要求**：pi + 已认证的模型 provider。无其他依赖，单文件自包含。
 
@@ -245,3 +372,73 @@ pi install git:github.com/xiandeleduan/pi-prompt-rewriter
 ### 许可证
 
 MIT
+
+### 配置
+
+默认值在 `extensions/prompt-rewriter.ts` 顶部：
+
+```ts
+const DEFAULT_CONFIG = {
+    enabled: true,        // 启动时是否开启自动重写
+    style: "balanced",    // "minimal" | "balanced" | "deep"
+    timeoutMs: 25_000,    // 超过这个时间就放弃，用原话发送
+    contextMessages: 12,  // 带多少条最近消息作上下文
+    contextCharLimit: 1200, // 单条消息最多取多少字符
+};
+```
+
+运行时的开关（`/rewrite off`、`/rewrite deep`）**只对当前会话生效**，重启后回到默认值。
+
+### 常见问题
+
+**`/rewrite` 提示不是命令**
+
+扩展没加载。执行 `/reload`。仍不行就确认文件在：
+
+```bash
+ls ~/.pi/agent/extensions/prompt-rewriter.ts
+```
+
+**F2 没反应**
+
+少数终端复用器/编辑器会截取 F2。先换一个干净终端试试。若确实被占，改文件顶部的常量：
+
+```ts
+const TOGGLE_SHORTCUT: Parameters<ExtensionAPI["registerShortcut"]>[0] = "f2";
+```
+
+换成 pi 未占用的键（`f3`、`f4` 都是空闲的）。**不要**用 `Ctrl+=` / `Ctrl+-` / `Ctrl+0`（终端缩放）或任何裸可打印字符。
+
+**消息没有被重写**
+
+看状态条：`跳过（too short）` 说明命中了跳过规则；`自动重写已关` 说明开关关着，按 `F2`；如果显示 `发送时重写` 但内容没变，可能重写失败了，用 `/rewrite stat` 看失败次数。
+
+**重写太激进 / 太保守**
+
+`/rewrite minimal` 贴近原话；`/rewrite deep` 会补约束条件和验证方法。
+
+**状态条完全不显示**
+
+它只在交互式 TUI（`ctx.mode === "tui"`）下渲染。print / JSON / RPC 模式没有输入框 widget。
+
+### 常见疑问
+
+**会多花 token 吗？**
+
+会。每条被重写的消息多一次模型调用，外加最多约 1200 字符 × 12 条上下文。跳过规则就是为了避免为 `好`、`/commands`、粘贴的结构化提示词白花钱。
+
+**会改我的历史消息吗？**
+
+不会。只重写即将发出的这一条，历史消息不动。
+
+**用哪个模型？**
+
+当前激活的模型（`ctx.model`）。不需要单独配 API key 或 provider。
+
+**能看到实际发出去的是什么吗？**
+
+能。重写后的文本会替换你的消息出现在对话里。`/rewrite last` 可以看原文与重写版对照。
+
+**非交互模式能用吗？**
+
+重写本身能用（含 `pi -p`），但跳过规则照常生效，且没有状态条。注意 `pi -p` **不派发斜杠命令**，那里的 `/rewrite` 会被当成普通文本。

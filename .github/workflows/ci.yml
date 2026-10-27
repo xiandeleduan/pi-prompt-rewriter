@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: Validate extension and manifest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate package.json
+        run: node -e "JSON.parse(require('fs').readFileSync('package.json','utf8')); console.log('package.json is valid JSON')"
+
+      - name: Check manifest points at an existing file
+        run: |
+          node -e "
+          const fs = require('fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const entries = pkg.pi?.extensions ?? [];
+          if (entries.length === 0) {
+            console.error('package.json declares no pi.extensions');
+            process.exit(1);
+          }
+          for (const rel of entries) {
+            const path = rel.replace(/^\.\//, '');
+            if (!fs.existsSync(path)) {
+              console.error('Declared extension does not exist: ' + rel);
+              process.exit(1);
+            }
+            console.log('OK: ' + rel);
+          }
+          "
+
+      - name: Type-check the extension
+        run: |
+          npm install --no-save --no-audit --no-fund typescript@5 @earendil-works/pi-coding-agent
+          npx tsc --noEmit --skipLibCheck --strict \
+            --module nodenext --moduleResolution nodenext \
+            --target es2022 \
+            extensions/prompt-rewriter.ts
+
+      - name: Confirm the extension exports a factory
+        run: |
+          grep -q 'export default function' extensions/prompt-rewriter.ts \
+            && echo "OK: exports a default factory" \
+            || { echo "Missing default export"; exit 1; }
