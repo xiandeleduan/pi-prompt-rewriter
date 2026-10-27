@@ -1,0 +1,35 @@
+{
+  "name": "pi-prompt-rewriter",
+  "version": "1.0.0",
+  "description": "Rewrite your rough instructions into clear prompts before they reach the model — using your current model, with conversation context.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "prompt",
+    "prompt-engineering",
+    "rewrite"
+  ],
+  "license": "MIT",
+  "author": "xiandeleduan <1427116865@qq.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiandeleduan/pi-prompt-rewriter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xiandeleduan/pi-prompt-rewriter/issues"
+  },
+  "homepage": "https://github.com/xiandeleduan/pi-prompt-rewriter#readme",
+  "pi": {
+    "extensions": [
+      "./extensions/prompt-rewriter.ts"
+    ]
+  },
+  "files": [
+    "extensions/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  }
+}

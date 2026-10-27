@@ -1,0 +1,12 @@
+# Normalize line endings: store LF in the repo, check out native on Windows
+* text=auto eol=lf
+
+# Explicit types for clarity
+*.ts   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+
+# Binary
+*.png  binary
+*.jpg  binary
+*.gif  binary
