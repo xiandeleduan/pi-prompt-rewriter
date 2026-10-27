@@ -139,14 +139,50 @@ Rewriting costs one API call. These cases are skipped automatically:
 
 - Empty input
 - `/` slash commands and `!` bash commands
-- Fewer than 12 characters **and** fewer than 4 CJK characters (`好`, `继续`, `ok`)
 - Pure punctuation / pure numbers
-- Already-structured prompts (markdown headings, code fences, XML tags — over a length threshold)
+- Already-structured prompts (a markdown heading **plus** a list, or long code fences / XML blocks)
 - Mid-stream steering and queued follow-ups (latency-sensitive; rewriting would add ~2s)
+
+### Short input is context-aware, not blindly skipped
+
+A blanket "skip anything under N characters" rule is wrong: short instructions are exactly the ones that need context to resolve. So short input is decided by two questions:
+
+1. **Does it already name its object?** If it contains a code identifier (`timeoutMs`, `src/db.ts`, `max_retries`), a number with a unit (`30秒`), or a quoted/code span, it's specific enough — skip.
+2. **Is there anything in the conversation to resolve against?** If recent messages contain identifiers, paths, or config values, and the input starts with a referring/action word (`再`, `改`, `调`, `why`, `revert`, `faster`, …), rewrite it.
+
+Concretely:
+
+| Input | Context | Result |
+|---|---|---|
+| `改一下` | empty session | skipped — nothing to resolve |
+| `改一下` | just discussed `src/db.ts` pool config | **rewritten** → `把 src/db.ts 里连接池配置改一下（你指的应该是 max 和 idleTimeout，请确认要改成多少）` |
+| `再快点` | any | **rewritten** — pure pacing instruction, but still context-dependent |
+| `继续` | any | skipped — a pure continuation carries no information to add |
+| `timeoutMs 改成 30` | any | skipped — already names the object |
+
+## How ambiguity is handled
+
+The rewriter is deliberately conservative about inventing things. Three rules keep it honest:
+
+1. **No invented constraints.** `只改这一处`, `不要动其他逻辑`, `保持现有风格` are only added when the conversation actually says so. Otherwise the rewriter would confidently contradict the user's own earlier instructions.
+2. **No invented background.** `刚才改的代码`, `上次那个方案` appear only if the conversation really contains them. In an empty session, `加个日志` becomes `在代码里加日志输出（我不确定你要加在哪个文件，请说明）` — not a fabricated story about "the code we just changed".
+3. **Unresolvable → ask, don't fill.** When a referent genuinely can't be found, the rewrite carries an explicit question (`（我不确定你指的是哪个 timeoutMs，请确认）`) instead of a vague filler sentence.
+
+### What the context window contains
+
+- **The first user message**, pinned. Session-opening constraints (`两个环境都要改`) would otherwise scroll out of a sliding window, and the model would then invent the opposite constraint.
+- **The most recent N messages** (default 12), user and assistant text.
+- **Tool output, truncated to 300 chars per result.** Tool results are where identifiers usually appear; dropping them entirely makes `把那个 3 改成 5` unresolvable.
+
+### Sampling
+
+Rewrite calls use `temperature: 0.2` and `maxTokens: 400` — this is a faithful-restatement task, not a creative one. A rewrite longer than 3× the original (with a 120-character floor) is discarded as padding and the original text is sent instead.
 
 ## Failure behavior
 
 Rewriting **never blocks sending**. If the model is unavailable, the API errors, the request times out (25s), or the response is empty, the original text is sent unchanged. You get a one-line warning, not a failed turn.
+
+If the model returns something identical to your input, it's treated as "already clear enough": the original is sent and the status bar shows `⟳ 原话已足够清晰`.
 
 ## Strengths
 
@@ -352,14 +388,50 @@ rm ~/.pi/agent/extensions/prompt-rewriter.ts              # 方式 B
 
 - 空输入
 - `/` 斜杠命令、`!` bash 命令
-- 短于 12 字符**且**少于 4 个中文字（`好`、`继续`、`ok`）
 - 纯符号 / 纯数字
-- 已经是结构化提示词的（markdown 标题、代码块、XML 标签，且有长度阈值）
+- 已经是结构化提示词的（markdown 标题 **加** 列表结构，或较长的代码块/XML 块）
 - 流式过程中的打断（steer）和排队消息（followUp）——延迟敏感，重写会加约 2 秒
+
+#### 短句不是无脑跳过，而是看上下文
+
+「短于 N 字就跳过」是错的设计：短指令恰恰最需要上下文。所以短句由两个问题决定：
+
+1. **它自己说清对象了吗？** 含代码标识符（`timeoutMs`、`src/db.ts`、`max_retries`）、带单位的数字（`30秒`）、引号或代码片段 → 已经够具体，跳过。
+2. **上下文里有东西可指代吗？** 如果最近消息里有标识符、路径、配置值，且这句话以指代/动作词开头（`再`、`改`、`调`、`why`、`revert`、`faster`…）→ 重写。
+
+实际效果：
+
+| 输入 | 上下文 | 结果 |
+|---|---|---|
+| `改一下` | 空会话 | 跳过（没东西可指代） |
+| `改一下` | 刚聊过 `src/db.ts` 连接池 | **重写** → `把 src/db.ts 里连接池配置改一下（你指的应该是 max 和 idleTimeout，请确认要改成多少）` |
+| `再快点` | 任意 | **重写**——虽是节奏指令，但仍依赖上下文 |
+| `继续` | 任意 | 跳过——纯推进词，没有可补的信息 |
+| `timeoutMs 改成 30` | 任意 | 跳过——已经点名对象 |
+
+### 怎么防止「会错意」
+
+重写器对「编造」很保守，三条规则：
+
+1. **不凭空加约束**。`只改这一处`、`不要动其他逻辑`、`保持现有风格` 只有在对话里真说过才加。否则重写会自信地违背用户之前的交代。
+2. **不凭空加背景**。`刚才改的代码`、`上次那个方案` 只在对话里真的出现过才写。空会话下 `加个日志` 会变成 `在代码里加日志输出（我不确定你要加在哪个文件，请说明）`，而不是编一段「我们刚才改的代码」。
+3. **找不到就要求澄清，不填空话**。关键指代确实找不到时，重写里带明确提问（`（我不确定你指的是哪个 timeoutMs，请确认）`），而不是一句万能套话。
+
+#### 上下文里到底装了什么
+
+- **第一条用户消息**，固定保留。会话开头的约束（`两个环境都要改`）否则会被滑动窗口挤出去，模型随后就会编出相反的约束。
+- **最近 N 条消息**（默认 12），只取用户和助手的文本。
+- **工具输出，每条截断到 300 字符**。标识符通常出现在工具结果里；完全丢掉会让 `把那个 3 改成 5` 无法消解。
+
+#### 采样参数
+
+重写用 `temperature: 0.2` 和 `maxTokens: 400` —— 这是忠实转述任务，不是创作。重写结果超过原话 3 倍（且有 120 字下限）就判为注水丢弃，改用原话发送。
 
 ### 失败时的行为
 
 **重写永远不会阻塞发送。** 模型不可用、API 报错、超时（25 秒）、返回空，都会用原话发送。只给一行提示，不会让这一轮失败。
+
+如果模型返回的内容和你的原话一模一样，视为「原话已够清晰」：原样发送，状态条显示 `⟳ 原话已足够清晰`。
 
 ### 力度
 

@@ -1,7 +1,7 @@
 {
   "name": "pi-prompt-rewriter",
-  "version": "1.0.0",
-  "description": "Rewrite your rough instructions into clear prompts before they reach the model — using your current model, with conversation context.",
+  "version": "1.1.0",
+  "description": "Rewrite your rough instructions into clear prompts before they reach the model — context-aware, with the current model.",
   "keywords": [
     "pi-package",
     "pi-extension",

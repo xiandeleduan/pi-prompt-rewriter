@@ -61,6 +61,58 @@ const MIN_CHARS = 12;
 const MIN_CJK = 4;
 
 /**
+ * 短但依赖上下文的开头词。
+ *
+ * 注意：这只是第一道筛选，不是唯一依据。
+ * 真正的判断在 shouldSkip 里的 hasResolvableContext()：
+ * 短句 + 上下文里有可消解的实体 → 重写。
+ */
+const CONTEXT_DEPENDENT =
+	/^(?:再|还|又|别|不要|不用|不是|不对|换个|换一种|重新|重来|为什么|为啥|怎么|如何|那|这|它|他|她|刚才|上面|之前|前面|其实|好像|感觉|应该|能不能|要不要|是不是|对不对|改|调|换|加|删|去掉|调大|调小|放大|缩小)|^(?:why|how|what|which|revert|undo|redo|again|faster|slower|bigger|smaller|change|fix|adjust|tweak|increase|decrease|make|try|no|not|nope|yes|ok|okay|continue|more|less|same|other|that|this|it|those|these|previous|last)\b/i;
+
+/**
+ * 短句里是否已经自带明确对象（不需要重写）。
+ *
+ * 命中任意一条就认为"用户说得够具体"，跳过：
+ * - 含代码标识符：驼峰（timeoutMs）、下划线（max_retries）、带点（src/db.ts）
+ * - 含路径分隔符
+ * - 含反引号/引号/引号式引用
+ * - 含数字 + 单位
+ *
+ * 注意：不能简单写成「3 个字母以上的英文单词」——
+ * 那样 why / revert / faster 这类英文短指令会被误判成"已经够具体"而跳过。
+ */
+const SELF_CONTAINED =
+	/[a-z][A-Z]|[A-Za-z]_[A-Za-z]|[A-Za-z]\.[A-Za-z]|[A-Za-z]\/[A-Za-z]|[A-Za-z]\d|\d[A-Za-z]|[A-Za-z]-[A-Za-z]|`|「|」|"|\d+\s*(?:秒|分钟|毫秒|次|个|条|行|字|%|px)/;
+
+/**
+ * 上下文里是否存在可被指代消解的实体。
+ * 只看最近几条，且只找"像标识符/路径/数字配置"的东西。
+ */
+function hasResolvableContext(ctx: ExtensionContext): boolean {
+	try {
+		const branch = ctx.sessionManager.getBranch();
+		let scanned = 0;
+		for (let i = branch.length - 1; i >= 0 && scanned < 6; i--) {
+			const entry = branch[i] as { type?: string; message?: { role?: string; content?: unknown } };
+			if (entry?.type !== "message") continue;
+			const role = entry.message?.role;
+			if (role !== "user" && role !== "assistant") continue;
+			const text = extractText(entry.message?.content);
+			if (!text) continue;
+			scanned++;
+			// 出现标识符/路径/带值配置，说明有东西可以被"那个"指代
+			if (/[A-Za-z_][A-Za-z0-9_]{2,}|\d+\s*(?:ms|s|秒|次)|[\w\-]+\.(?:ts|js|json|py|go|rs|md)/.test(text)) {
+				return true;
+			}
+		}
+	} catch {
+		// 取不到上下文就当没有
+	}
+	return false;
+}
+
+/**
  * 切换自动重写开关的快捷键。
  *
  * 选 f2 的理由：
@@ -69,6 +121,18 @@ const MIN_CJK = 4;
  * - f2 在 pi 内置绑定里未占用，终端也不会截取
  */
 const TOGGLE_SHORTCUT: Parameters<ExtensionAPI["registerShortcut"]>[0] = "f2";
+
+/**
+ * 重写结果最多是原话的多少倍。
+ * 超了就当作注水丢弃，用原话发送。
+ */
+const MAX_EXPANSION_RATIO = 3;
+
+/**
+ * 防注水的绝对下限（字符）。
+ * 原话很短时（"再快点"）按倍数算太小，给个宽容的底线。
+ */
+const MIN_EXPANSION_FLOOR = 120;
 
 // ---------------------------------------------------------------------------
 // 提示词
@@ -86,8 +150,18 @@ const SYSTEM_PROMPT = `你是一个提示词重写器。你的唯一任务是：
 
 - **不改变意图**。用户想做什么就是做什么，不要自作主张扩大或缩小范围。
 - **把指代替换掉**。"这个" "那个" "上面说的" → 换成上下文里的具体对象（文件名、函数名、报错内容、需求名）。
-- **补上期望产出**。如果用户没说清楚要什么形式的结果，用上下文推断；推断不出就写"给出可执行的结论"。
-- **补上必要的约束**。只补上下文里已经隐含的约束（比如"不要改其他文件"、"保持现有风格"），不要凭空发明需求。
+- **补上期望产出**。如果用户没说清楚要什么形式的结果，用上下文推断。
+- **推断不出就不要编**。宁可保留模糊，也不要填"给出可执行的结论"这类万能话术。
+  如果关键指代在上下文里确实找不到，就在重写里明确要求澄清，例如
+  "（我不确定你指的是哪个 timeoutMs，请确认）"。
+- **不要凭空添加约束**。像"只改这一处" "不要动其他逻辑" "保持现有风格"这种限制，
+  只有当上下文里确实有依据（用户说过，或会话开头的设定里写了）才能加。
+  上下文没说就不要加 —— 编出来的约束往往和用户的真实意图相反。
+- **不要凭空添加背景事实**。上下文里没有的东西，一个字都不要写。特别是：
+  - 不要说"刚才改的代码" "当前正在改的地方" —— 除非上下文里真的出现过改动
+  - 不要说"之前那个方案" "上次提到的" —— 除非上下文里真的提过
+  - 不要补文件名、函数名、变量名、报错信息
+  上下文是空的、或者跟这句话无关时，就直接按字面意思重写，不要给它配一个假背景。
 - **保留用户的语气和态度**。用户在生气就还是生气，用户在催就还是催。
 - **长度控制**。一般 1-3 句就够。原话已经清楚就直接润色，不要注水。
 
@@ -123,12 +197,22 @@ const SKIP_PATTERNS: Array<{ test: (t: string) => boolean; reason: string }> = [
 	{ test: (t) => !/[\p{L}\p{N}]/u.test(t), reason: "no letters" },
 	{ test: (t) => /^[\d\s.,;:!?%+\-*/=()]+$/.test(t), reason: "numbers only" },
 	// 已经结构化：markdown 标题 / 编号列表 / XML 标签 / 代码围栏
+	// 标题 + 列表同时存在，说明用户已经写得很有条理，不用重写（不限长度）
+	{ test: (t) => /^#{1,6}\s/m.test(t) && /^\s*(?:[-*+]|\d+[.)])\s/m.test(t), reason: "already structured" },
 	{ test: (t) => /^#{1,6}\s/m.test(t) && t.length > 200, reason: "already structured" },
 	{ test: (t) => /^```/m.test(t) && t.length > 300, reason: "already structured" },
 	{ test: (t) => /^<\w+[\s>]/m.test(t) && t.length > 200, reason: "already structured" },
 ];
 
-function shouldSkip(text: string): string | null {
+/**
+ * 判断这句话要不要跳过重写。
+ *
+ * resolvable: 上下文里是否存在可被指代消解的实体。
+ *   - 不传：不做上下文判断（纯文本规则），用于无 ctx 的场合
+ *   - false：上下文没有可指代的东西，短句跳过
+ *   - true：短句若含指代/动作词则重写
+ */
+function shouldSkip(text: string, resolvable?: boolean): string | null {
 	const t = text.trim();
 	if (t.length === 0) return "empty";
 
@@ -136,10 +220,17 @@ function shouldSkip(text: string): string | null {
 		if (test(t)) return reason;
 	}
 
-	// 太短：字符数不够，或中文字数不够
 	if (t.length < MIN_CHARS) {
 		const cjk = (t.match(/[\u4e00-\u9fff]/g) ?? []).length;
-		if (cjk < MIN_CJK) return "too short";
+		if (cjk >= MIN_CJK) return null;
+
+		// 短句里有明确对象（timeoutMs、src/db.ts、30秒、`code`）→ 不用重写
+		if (SELF_CONTAINED.test(t)) return "too short";
+
+		// 短句以指代/动作词开头，且上下文里有可消解的实体 → 重写
+		if (resolvable && CONTEXT_DEPENDENT.test(t)) return null;
+
+		return "too short";
 	}
 
 	return null;
@@ -167,34 +258,92 @@ function extractText(content: unknown): string {
 }
 
 /**
- * 取最近 N 条对话作为重写上下文。
- * 只取 user/assistant 的纯文本，跳过 tool call 和 tool result（噪音太大，且会撑爆）。
+ * 工具输出在上下文里保留多少字符。
+ *
+ * 工具结果是指代消解的关键（"把那个 3 改成 5" 里的 3 往往只在工具输出里出现过），
+ * 但全文太长，所以只留开头一段。
+ */
+const TOOL_RESULT_PREVIEW = 300;
+
+/**
+ * 把一条 session entry 转成上下文里的一行。
+ * 返回 null 表示这条不参与上下文（非消息、或没有文本）。
+ */
+function extractContextEntry(entry: unknown, cfg: Config): string | null {
+	if (!entry || typeof entry !== "object") return null;
+	const e = entry as { type?: string; message?: { role?: string; content?: unknown; toolName?: string; isError?: boolean } };
+	if (e.type !== "message") return null;
+
+	const msg = e.message;
+	const role = msg?.role;
+	if (!role) return null;
+
+	// 工具结果：截断后保留，用于指代消解
+	if (role === "toolResult") {
+		let text = extractText(msg.content);
+		if (!text) return null;
+		if (text.length > TOOL_RESULT_PREVIEW) {
+			text = `${text.slice(0, TOOL_RESULT_PREVIEW)}…[工具输出已截断]`;
+		}
+		const label = msg.toolName ? `工具输出(${msg.toolName})` : "工具输出";
+		return `${label}${msg.isError ? "[失败]" : ""}: ${text}`;
+	}
+
+	if (role !== "user" && role !== "assistant") return null;
+
+	let text = extractText(msg.content);
+	if (!text) return null;
+
+	if (text.length > cfg.contextCharLimit) {
+		text = `${text.slice(0, cfg.contextCharLimit)}…[已截断]`;
+	}
+
+	return `${role === "user" ? "用户" : "助手"}: ${text}`;
+}
+
+/**
+ * 取上下文：会话开头的设定 + 最近 N 条对话。
+ *
+ * 为什么两段都要：
+ * - 只取最近 N 条时，会话开头定下的关键约束（"两个环境都要改"）会被挤出窗口，
+ *   重写模型就会按默认习惯编出相反的约束。
+ * - 工具结果被保留，否则"那个 3"这类指代无从消解。
  */
 function buildContext(ctx: ExtensionContext, cfg: Config): string {
 	const branch = ctx.sessionManager.getBranch();
+
+	// 1. 固定保留第一条用户消息（通常包含任务设定/背景约束）
+	let firstUserText = "";
+	let firstUserIndex = -1;
+	for (let i = 0; i < branch.length; i++) {
+		const entry = branch[i] as { type?: string; message?: { role?: string; content?: unknown } };
+		if (entry?.type !== "message") continue;
+		if (entry.message?.role !== "user") continue;
+		const text = extractText(entry.message.content);
+		if (!text) continue;
+		firstUserText =
+			text.length > cfg.contextCharLimit
+				? `${text.slice(0, cfg.contextCharLimit)}…[已截断]`
+				: text;
+		firstUserIndex = i;
+		break;
+	}
+
+	// 2. 最近 N 条（跳过已被首条占用的那条，避免重复）
 	const lines: string[] = [];
 	let taken = 0;
-
 	for (let i = branch.length - 1; i >= 0 && taken < cfg.contextMessages; i--) {
-		const entry = branch[i];
-		if (entry.type !== "message") continue;
-
-		const msg = entry.message as { role?: string; content?: unknown };
-		const role = msg.role;
-		if (role !== "user" && role !== "assistant") continue;
-
-		let text = extractText(msg.content);
-		if (!text) continue;
-
-		if (text.length > cfg.contextCharLimit) {
-			text = `${text.slice(0, cfg.contextCharLimit)}…[已截断]`;
-		}
-
-		lines.unshift(`${role === "user" ? "用户" : "助手"}: ${text}`);
+		if (i === firstUserIndex) continue;
+		const line = extractContextEntry(branch[i], cfg);
+		if (!line) continue;
+		lines.unshift(line);
 		taken++;
 	}
 
-	return lines.join("\n\n");
+	const parts: string[] = [];
+	if (firstUserText) parts.push(`【会话开头的设定】\n用户: ${firstUserText}`);
+	if (lines.length > 0) parts.push(`【最近对话】\n${lines.join("\n\n")}`);
+	return parts.join("\n\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +395,14 @@ async function rewrite(
 					},
 				],
 			},
-			{ signal: combined, cacheRetention: "none" },
+			{
+				signal: combined,
+				cacheRetention: "none",
+				// 重写是"忠实转述"任务，不是创作 —— 低温度减少随机发挥
+				temperature: 0.2,
+				// 重写结果不该长到哪去；硬上限防止模型注水
+				maxTokens: 400,
+			},
 		);
 
 		if (response.stopReason === "aborted") {
@@ -271,6 +427,13 @@ async function rewrite(
 		const cleaned = stripWrapper(out);
 		if (!cleaned) {
 			return { ok: false, text, error: "empty rewrite", ms: Date.now() - started };
+		}
+
+		// 防注水：重写结果远超原话就丢弃，用原话发送。
+		// 否则模型会把一句话扩成一段废话，反而降低信噪比。
+		const allowed = Math.max(text.length * MAX_EXPANSION_RATIO, MIN_EXPANSION_FLOOR);
+		if (cleaned.length > allowed) {
+			return { ok: false, text, error: "rewrite too verbose", ms: Date.now() - started };
 		}
 
 		return { ok: true, text: cleaned, ms: Date.now() - started };
@@ -355,7 +518,7 @@ export default function (pi: ExtensionAPI) {
 		if (busy) return { action: "continue" as const };
 
 		const original = event.text;
-		const skipReason = shouldSkip(original);
+		const skipReason = shouldSkip(original, hasResolvableContext(ctx));
 		if (skipReason) {
 			stats.skipped++;
 			return { action: "continue" as const };
@@ -380,9 +543,13 @@ export default function (pi: ExtensionAPI) {
 				return { action: "continue" as const };
 			}
 
-			// 重写结果和原话几乎一样 → 不折腾
+			// 重写结果和原话几乎一样 → 不折腾，但给个轻提示，
+			// 否则用户看到状态条写着"会重写"却什么都没发生，会以为插件挂了。
 			if (normalizeForCompare(result.text) === normalizeForCompare(original)) {
 				stats.skipped++;
+				if (ctx.hasUI) {
+					ctx.ui.setStatus("prompt-rewriter-last", `⟳ 原话已足够清晰`);
+				}
 				return { action: "continue" as const };
 			}
 
@@ -468,7 +635,7 @@ export default function (pi: ExtensionAPI) {
 				const lines = draft.split("\n");
 				const chars = draft.length;
 				const preview = lines[0].slice(0, 60) + (lines[0].length > 60 ? "…" : "");
-				const skip = shouldSkip(trimmed);
+				const skip = shouldSkip(trimmed, hasResolvableContext(ctx));
 
 				// 有 UI 时用多行编辑器展示全文，可滚动查看、也可顺手改完回填
 				if (ctx.mode === "tui") {
@@ -528,7 +695,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 
-				const skip = shouldSkip(draft);
+				const skip = shouldSkip(draft, hasResolvableContext(ctx));
 				if (skip) {
 					ctx.ui.notify(`这句会跳过重写（${skip}），无需手动执行。`, "info");
 					return;
@@ -667,6 +834,22 @@ function mountDraftWidget(ctx: ExtensionContext, cfg: Config): void {
 	// 所以这里把 ui 的引用先取出来存下，并全部用 try/catch 包住。
 	const ui = ctx.ui;
 
+	// 状态条在 render() 里跑，每次重绘都调 getBranch() 太浪费。
+	// 每 2 秒最多算一次"上下文里有没有可消解实体"，其余时间用缓存值。
+	let cachedResolvable = false;
+	let cacheAt = 0;
+	const refreshResolvable = () => {
+		const now = Date.now();
+		if (now - cacheAt < 2000) return cachedResolvable;
+		cacheAt = now;
+		try {
+			cachedResolvable = hasResolvableContext(ctx);
+		} catch {
+			cachedResolvable = false;
+		}
+		return cachedResolvable;
+	};
+
 	ctx.ui.setWidget(
 		WIDGET_KEY,
 		(_tui, theme) => ({
@@ -682,7 +865,9 @@ function mountDraftWidget(ctx: ExtensionContext, cfg: Config): void {
 						: theme.fg("warning", "自动重写 关");
 
 					// 空输入框也常驻显示，只是没有"跳过/发送时重写"这类跟内容相关的状态
-					const skip = text ? shouldSkip(text) : null;
+					// 注意：状态条在 render() 里跑，不能每次调 getBranch()（会拖慢重绘）。
+					// 所以这里用缓存的"上下文是否有可消解实体"，每 2 秒重算一次。
+					const skip = text ? shouldSkip(text, refreshResolvable()) : null;
 					const state = skip
 						? theme.fg("muted", `跳过（${skip}）`)
 						: cfg.enabled
