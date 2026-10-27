@@ -436,7 +436,12 @@ async function rewrite(
 			return { ok: false, text, error: "rewrite too verbose", ms: Date.now() - started };
 		}
 
-		return { ok: true, text: cleaned, ms: Date.now() - started };
+		// 防背景幻觉：提示词已经禁止编造"刚才改的代码"这类背景，
+		// 但模型偶尔仍会违反。这里做代码级兜底：
+		// 输出里出现这类词，而上下文里根本没有对应的改动痕迹 → 剥掉这句。
+		const guarded = stripFabricatedBackground(cleaned, context);
+
+		return { ok: true, text: guarded, ms: Date.now() - started };
 	} catch (err) {
 		return {
 			ok: false,
@@ -447,6 +452,41 @@ async function rewrite(
 	} finally {
 		clearTimeout(timer);
 	}
+}
+
+/**
+ * 输出里“编造背景”的说法。
+ * 这些词只能在上文真的存在对应内容时使用。
+ */
+const FABRICATED_BACKGROUND =
+	/(?:刚才|刚刚|刚|上次|之前|前面)(?:改|动|写|做|说|提|讨论|聊)(?:过)?的?|(?:正在|当前正在)(?:改|修改|编辑|做|处理)的?|当前正在处理|刚才那(?:个|些|次)|上面那(?:个|些)/;
+
+/**
+ * 剥掉编造的背景描述。
+ *
+ * 提示词里已经要求“不要凭空添加背景事实”，但模型仍会偶发违反
+ * （实测空会话下输入“加个日志”会得到“在当前正在修改的代码里加日志输出”）。
+ *
+ * 处理方式：
+ * - 若上下文里确实有改动痕迹（改/修改/已改/重构 等），保留原文
+ * - 否则把命中的短语替换成中性词（“当前代码”），不整句丢弃，
+ *   因为句子的其余部分（“加日志输出”）仍然是用户要的
+ */
+function stripFabricatedBackground(text: string, context: string): string {
+	if (!FABRICATED_BACKGROUND.test(text)) return text;
+
+	// 上下文里真有改动痕迹 → 模型没编，原样保留
+	if (/(?:改|修改|重构|更新|替换|删除|新增|已改|改成)/.test(context)) return text;
+
+	return text
+		.replace(/在(?:当前|刚才)?正在(?:改|修改|编辑|做|处理)的?代码(?:里|中|处)?/g, "在代码里")
+		.replace(/当前正在处理(?:的)?(?:代码|逻辑|部分)?/g, "当前代码")
+		.replace(/(?:刚才|刚刚|刚|上次|之前|前面)(?:改|动|写|做|说|提|讨论|聊)(?:过)?的?(?:代码|改动|地方|那部分|内容)?/g, "当前代码")
+		.replace(/当前正在(?:改|修改|编辑)的/g, "当前")
+		.replace(/刚才那(?:个|些|次)/g, "")
+		.replace(/上面那(?:个|些)/g, "")
+		.replace(/\s{2,}/g, " ")
+		.trim();
 }
 
 /** 去掉模型爱加的 ``` 围栏和 "这是重写后的提示词：" 前缀 */
